@@ -73,18 +73,38 @@ function createGainFader(
 ) {
   let rampTimeout: number | null = null;
 
+  // Gain is linear, but perceived loudness isn't, so a plain
+  // linearRampToValueAtTime from 1 to 0 sounds like it stays at full volume
+  // for most of the ramp and only drops at the very end (a "delayed cut").
+  // The natural fix, exponentialRampToValueAtTime, overcorrects at the
+  // short durations used here (~200ms): the spec forbids ramping to/from
+  // exactly 0, so the target has to be approximated with a tiny value, and
+  // covering that huge dB range (0 to roughly -80dB) in a couple hundred ms
+  // dumps nearly all of the audible drop into the first third of the ramp -
+  // it sounds like an instant cut followed by inaudible silence, not a
+  // fade (measured live: gain reaches -75dB by 30% of the ramp). An
+  // equal-power curve (the standard crossfade curve, built from cos/sin of
+  // the same angle) spreads the perceived drop evenly across the whole
+  // duration in both directions and reaches the target exactly, so no
+  // near-zero approximation is needed.
+  const CURVE_LENGTH = 32;
+
   const rampTo = (target: number, durationMs: number, onDone?: () => void) => {
     if (rampTimeout !== null) {
       window.clearTimeout(rampTimeout);
       rampTimeout = null;
     }
     const now = audioContext.currentTime;
-    // Pin the actually-reached value before cancelling, otherwise
-    // cancelScheduledValues can leave/jump to a stale target.
+    const startValue = gainNode.gain.value;
     gainNode.gain.cancelScheduledValues(now);
-    gainNode.gain.setValueAtTime(gainNode.gain.value, now);
     const durationSec = durationMs / 1000;
-    gainNode.gain.linearRampToValueAtTime(target, now + durationSec);
+    const curve = new Float32Array(CURVE_LENGTH);
+    for (let i = 0; i < CURVE_LENGTH; i++) {
+      const angle = (i / (CURVE_LENGTH - 1)) * (Math.PI / 2);
+      curve[i] =
+        (startValue * Math.cos(angle)) + (target * Math.sin(angle));
+    }
+    gainNode.gain.setValueCurveAtTime(curve, now, durationSec);
     debug.isFading = true;
     rampTimeout = window.setTimeout(() => {
       rampTimeout = null;
@@ -140,11 +160,19 @@ function setupSmoothTransitions(
     configurable: true,
     get: () => intendedPaused,
   });
+  // Tracks whether the video *really* paused (a genuine native 'pause'
+  // event fired), independent of `intendedPaused` above - needed because a
+  // pause fade can be cancelled by a follow-up play() before its deferred
+  // originalVideoPause() ever runs, leaving the element never actually
+  // paused even though intendedPaused briefly said otherwise.
+  let realPauseFired = false;
   const onNativePause = () => {
     intendedPaused = true;
+    realPauseFired = true;
   };
   const onNativePlay = () => {
     intendedPaused = false;
+    realPauseFired = false;
   };
   video.addEventListener('pause', onNativePause);
   video.addEventListener('play', onNativePlay);
@@ -180,6 +208,8 @@ function setupSmoothTransitions(
   };
 
   video.play = () => {
+    const wasIntendedPaused = intendedPaused;
+    const wasReallyPaused = realPauseFired;
     intendedPaused = false;
     pauseFadeToken++; // invalidates any in-flight pause fade
     debug.pauseFadeToken = pauseFadeToken;
@@ -193,7 +223,21 @@ function setupSmoothTransitions(
       const config = getConfig();
       fader.rampTo(1, config?.pauseFadeDuration ?? 250);
     }
-    return originalVideoPlay();
+    const result = originalVideoPlay();
+    // If a pause fade was in flight and got invalidated by this very call
+    // before its deferred originalVideoPause() ever ran, the element was
+    // never actually paused - calling play() on an already-playing element
+    // is a spec-mandated no-op that fires no 'play'/'playing' event. Any
+    // outside code that reacted to the earlier pause() call (e.g. the
+    // player bar's own button, which flips its icon/title the moment
+    // pause() is called, then waits for a real event to confirm resuming)
+    // would otherwise be stuck showing "paused" forever despite playback
+    // never having stopped - dispatch the events ourselves so it resyncs.
+    if (wasIntendedPaused && !wasReallyPaused) {
+      video.dispatchEvent(new Event('play'));
+      video.dispatchEvent(new Event('playing'));
+    }
+    return result;
   };
 
   // Route the higher-level player API through the same patched methods,
@@ -284,8 +328,7 @@ function setupSmoothTransitions(
     api.previousVideo = wrapTrackChange(originalPrevVideo)!;
   if (originalLoadByVars)
     api.loadVideoByPlayerVars = wrapTrackChange(originalLoadByVars)!;
-  if (originalLoadById)
-    api.loadVideoById = wrapTrackChange(originalLoadById)!;
+  if (originalLoadById) api.loadVideoById = wrapTrackChange(originalLoadById)!;
   if (originalLoadByUrl)
     api.loadVideoByUrl = wrapTrackChange(originalLoadByUrl)!;
   if (originalCueByVars)
@@ -293,8 +336,9 @@ function setupSmoothTransitions(
   if (originalCueById) api.cueVideoById = wrapTrackChange(originalCueById)!;
   if (originalCueByUrl) api.cueVideoByUrl = wrapTrackChange(originalCueByUrl)!;
   if (originalLoadPlaylist) {
-    (api as unknown as { loadPlaylist: (...args: unknown[]) => unknown }).loadPlaylist =
-      wrapTrackChange(originalLoadPlaylist)!;
+    (
+      api as unknown as { loadPlaylist: (...args: unknown[]) => unknown }
+    ).loadPlaylist = wrapTrackChange(originalLoadPlaylist)!;
   }
 
   let isBypassing = false;
@@ -354,6 +398,76 @@ function setupSmoothTransitions(
     });
   };
 
+  const originalSetActionHandler =
+    'mediaSession' in navigator
+      ? navigator.mediaSession.setActionHandler.bind(navigator.mediaSession)
+      : null;
+
+  if (originalSetActionHandler) {
+    navigator.mediaSession.setActionHandler = (action, handler) => {
+      if (!handler) {
+        return originalSetActionHandler(action, null);
+      }
+
+      if (action === 'nexttrack' || action === 'previoustrack') {
+        const wrappedHandler = (details: MediaSessionActionDetails) => {
+          const config = getConfig();
+          if (!config?.fadeOnSkip || video.paused || fader.get() <= 0) {
+            return handler(details);
+          }
+
+          const token = ++skipFadeToken;
+          debug.skipFadeToken = skipFadeToken;
+          fader.rampTo(0, config.skipFadeDuration, () => {
+            if (token !== skipFadeToken) return;
+            handler(details);
+          });
+        };
+        return originalSetActionHandler(action, wrappedHandler);
+      }
+
+      if (action === 'pause') {
+        const wrappedHandler = () => {
+          video.pause();
+        };
+        return originalSetActionHandler(action, wrappedHandler);
+      }
+
+      if (action === 'play') {
+        const wrappedHandler = () => {
+          video.play();
+        };
+        return originalSetActionHandler(action, wrappedHandler);
+      }
+
+      return originalSetActionHandler(action, handler);
+    };
+
+    skipTeardowns.push(() => {
+      navigator.mediaSession.setActionHandler = originalSetActionHandler;
+    });
+  }
+
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (
+      event.key === 'MediaTrackNext' ||
+      event.key === 'MediaTrackPrevious' ||
+      event.code === 'MediaTrackNext' ||
+      event.code === 'MediaTrackPrevious'
+    ) {
+      const config = getConfig();
+      if (!config?.fadeOnSkip || video.paused || fader.get() <= 0) return;
+
+      ++skipFadeToken;
+      debug.skipFadeToken = skipFadeToken;
+      fader.rampTo(0, config.skipFadeDuration);
+    }
+  };
+  window.addEventListener('keydown', onKeyDown, true);
+  skipTeardowns.push(() =>
+    window.removeEventListener('keydown', onKeyDown, true),
+  );
+
   document.addEventListener('click', onDocumentClick, true);
   skipTeardowns.push(() =>
     document.removeEventListener('click', onDocumentClick, true),
@@ -380,8 +494,9 @@ function setupSmoothTransitions(
     if (originalCueById) api.cueVideoById = originalCueById;
     if (originalCueByUrl) api.cueVideoByUrl = originalCueByUrl;
     if (originalLoadPlaylist) {
-      (api as unknown as { loadPlaylist: (...args: unknown[]) => unknown }).loadPlaylist =
-        originalLoadPlaylist;
+      (
+        api as unknown as { loadPlaylist: (...args: unknown[]) => unknown }
+      ).loadPlaylist = originalLoadPlaylist;
     }
     for (const teardown of skipTeardowns) teardown();
     debug.video = null;
@@ -391,12 +506,16 @@ function setupSmoothTransitions(
 /**
  * Waits for the app's Web Audio graph (via peard:audio-can-play) and
  * inserts a GainNode into it, then attaches setupSmoothTransitions using
- * that gain node exclusively - no video.volume-based fallback. If the
- * video element is ever replaced (e.g. after the OS sleeps/wakes), the
- * gain node's binding to the old audio source goes stale, so fading is
- * disabled for the rest of that session rather than falling back to
- * touching video.volume directly, which would reintroduce the conflict
- * with plugins like Exponential Volume that this design avoids.
+ * that gain node exclusively - no video.volume-based fallback. If the video
+ * element is ever replaced (e.g. after the OS sleeps/wakes), the old gain
+ * node's binding goes stale and can't follow it, so a fresh one is wired
+ * straight onto the new element using the same shared AudioContext - no
+ * dependency on renderer.ts redoing anything, since a media element can
+ * only ever be captured by one MediaElementAudioSourceNode and nothing else
+ * has claimed the new one yet. If that ever fails, fading is disabled for
+ * the rest of the session rather than falling back to touching
+ * video.volume directly, which would reintroduce the conflict with plugins
+ * like Exponential Volume that this design avoids.
  *
  * Also exposes window.__smoothTransitionsDebug for inspection from
  * DevTools if something goes wrong.
@@ -408,6 +527,11 @@ function superviseSmoothTransitions(
   let stopCurrent: Teardown | null = null;
   let fader: GainFader | null = null;
   let disabled = false;
+  // Retained purely so a later video-element swap (e.g. after the OS
+  // sleeps/wakes) can wire a fresh gain node on its own, without depending
+  // on renderer.ts to redo anything - it only ever handed us this context
+  // and a source bound to the *original* video once, at startup.
+  let sharedAudioContext: AudioContext | null = null;
 
   const debug: DebugState = {
     video: null,
@@ -428,27 +552,52 @@ function superviseSmoothTransitions(
     stopCurrent = setupSmoothTransitions(video, api, getConfig, debug, fader);
   };
 
+  // Inserts a GainNode between `video` and speakers and wraps it in a
+  // fader. Used both for the very first video (via the audioSource
+  // renderer.ts already created for it) and to rebuild from scratch after
+  // a video-element swap, where nothing has claimed the new element's
+  // audio yet - a media element can only ever be captured by one
+  // MediaElementAudioSourceNode, so this only works while that's still true
+  // for `video`.
+  const wireGainNode = (
+    audioContext: AudioContext,
+    audioSource: MediaElementAudioSourceNode,
+  ): GainFader | null => {
+    try {
+      const gainNode = audioContext.createGain();
+      gainNode.gain.value = 0;
+      // Only the very first video's audioSource is pre-connected straight
+      // to destination (by renderer.ts, before this plugin ever sees it) -
+      // a source created here for a swapped-in video starts unconnected,
+      // so disconnecting a nonexistent edge would throw.
+      try {
+        audioSource.disconnect(audioContext.destination);
+      } catch {
+        // not connected to destination - nothing to undo
+      }
+      audioSource.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      return createGainFader(gainNode, audioContext, debug);
+    } catch (err) {
+      console.error('[smooth-transitions] failed to insert gain node', err);
+      return null;
+    }
+  };
+
   const onAudioCanPlay = (event: Event) => {
     if (fader || disabled) return;
     const { audioContext, audioSource } = (
       event as CustomEvent<AudioCanPlayDetail>
     ).detail;
     const video = document.querySelector<HTMLVideoElement>('video');
-    try {
-      const gainNode = audioContext.createGain();
-      gainNode.gain.value = 0;
-      audioSource.disconnect(audioContext.destination);
-      audioSource.connect(gainNode);
-      gainNode.connect(audioContext.destination);
-
-      fader = createGainFader(gainNode, audioContext, debug);
-      debug.gainReady = true;
-    } catch (err) {
-      console.error('[smooth-transitions] failed to insert gain node', err);
+    sharedAudioContext = audioContext;
+    fader = wireGainNode(audioContext, audioSource);
+    if (!fader) {
       disabled = true;
       debug.disabled = true;
       return;
     }
+    debug.gainReady = true;
 
     attachIfPossible();
     // The instance's own native 'play'-driven resync only covers *future*
@@ -474,30 +623,46 @@ function superviseSmoothTransitions(
     const video = document.querySelector<HTMLVideoElement>('video');
     if (!video) return;
 
-    if (lastSeenVideo === null) {
+    if (video !== lastSeenVideo) {
       lastSeenVideo = video;
-      attachIfPossible();
-      return;
-    }
-    if (video === lastSeenVideo) {
-      attachIfPossible();
-      return;
-    }
+      stopCurrent?.();
+      stopCurrent = null;
 
-    // The video element was replaced (e.g. after sleep/wake, or a GPU
-    // process restart). The gain node stays bound to the old, now-stale
-    // audioSource - there's no safe way to reattach it to the new
-    // element, and falling back to video.volume would reintroduce the
-    // Exponential Volume conflict this design avoids. Disable fading for
-    // the rest of this session instead of silently misbehaving.
-    console.log(
-      '[smooth-transitions] video element changed, disabling fades for this session',
-    );
-    lastSeenVideo = video;
-    stopCurrent?.();
-    stopCurrent = null;
-    disabled = true;
-    debug.disabled = true;
+      if (fader) {
+        // The video element was replaced (e.g. after sleep/wake, or a GPU
+        // process restart). The old gain node is permanently bound to the
+        // now-detached element and can't follow, but nobody has claimed
+        // the *new* element's audio yet, so a fresh GainNode can be wired
+        // straight onto it - same as the very first attach, just reusing
+        // the shared AudioContext instead of waiting for renderer.ts to
+        // hand us a new peard:audio-can-play (it never fires again for a
+        // swapped element, since renderer.ts's own loadstart/canplaythrough
+        // listeners are still bound to the old one).
+        fader.dispose();
+        fader = null;
+        debug.gainReady = false;
+        if (sharedAudioContext) {
+          const audioSource =
+            sharedAudioContext.createMediaElementSource(video);
+          fader = wireGainNode(sharedAudioContext, audioSource);
+        }
+        if (!fader) {
+          console.error(
+            '[smooth-transitions] could not rewire gain node onto the replaced video element, disabling fades for this session',
+          );
+          disabled = true;
+          debug.disabled = true;
+          return;
+        }
+        debug.gainReady = true;
+        // The new element's audio was just rerouted into a gain node that
+        // starts silent - unlike the very first attach, playback here is
+        // already underway (this element replaced one that was mid-song),
+        // so snap straight to audible instead of gliding up from silence.
+        fader.rampTo(1, 1);
+      }
+    }
+    attachIfPossible();
   };
   const observer = new MutationObserver(onDomChange);
   observer.observe(document.body, { childList: true, subtree: true });
