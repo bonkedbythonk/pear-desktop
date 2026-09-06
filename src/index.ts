@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 
+import dockIconDark from '@assets/dock-icon-dark.png?asset&asarUnpack';
+import dockIconLight from '@assets/dock-icon-light.png?asset&asarUnpack';
 import ErrorHtmlAsset from '@assets/error.html?asset';
 import musicPlayerIcon from '@assets/icon.png?asset&asarUnpack';
 import {
@@ -19,6 +21,7 @@ import {
   dialog,
   ipcMain,
   protocol,
+  nativeTheme,
   type BrowserWindowConstructorOptions,
 } from 'electron';
 import electronDebug from 'electron-debug';
@@ -687,6 +690,20 @@ const getDefaultLocale = (locale: string) =>
   availableLanguages.includes(locale) ? locale : null;
 
 app.whenReady().then(async () => {
+  // The app bundle's own icon (Finder, Launchpad, before launch) is baked in
+  // at build time and can't react to the system appearance, but the Dock
+  // icon can be swapped at runtime - do that here and keep it in sync with
+  // live appearance changes.
+  if (is.macOS()) {
+    const updateDockIcon = () => {
+      app.dock?.setIcon(
+        nativeTheme.shouldUseDarkColors ? dockIconDark : dockIconLight,
+      );
+    };
+    updateDockIcon();
+    nativeTheme.on('updated', updateDockIcon);
+  }
+
   if (!config.get('options.language')) {
     const locale = getDefaultLocale(app.getLocale());
     if (locale) {
