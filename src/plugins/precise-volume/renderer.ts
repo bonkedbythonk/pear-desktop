@@ -28,13 +28,41 @@ export const onPlayerApiReady = async (
   playerApi: MusicPlayer,
   context: RendererContext<PreciseVolumePluginConfig>,
 ) => {
-  options = await context.getConfig();
   api = playerApi;
+  options =
+    (window.mainConfig.get(
+      'plugins.precise-volume',
+    ) as PreciseVolumePluginConfig) ?? (await context.getConfig());
 
-  // Without this function it would rewrite config 20 time when volume change by 20
-  const writeOptions = debounce(() => {
-    context.setConfig(options);
-  }, 1000);
+  // updateVolumeSlider() clamps any 1-4 value to "5" for display (the
+  // slider can't render below 5 meaningfully) - the observer below must
+  // not mistake that self-inflicted mutation for a manual drag, or every
+  // volume saved as 1-4 gets immediately overwritten to 5.
+  let suppressNextSliderChange = false;
+
+  // Without this it would rewrite config 20 times when volume changes by 20.
+  // Debounced, and flush on unload/pagehide so Cmd+Q never drops the saved volume.
+  let pendingSave: ReturnType<typeof setTimeout> | null = null;
+  const flushSave = () => {
+    if (pendingSave !== null) {
+      clearTimeout(pendingSave);
+      pendingSave = null;
+    }
+    if (options && typeof options.savedVolume === 'number') {
+      context.setConfig(options);
+    }
+  };
+
+  const writeOptions = () => {
+    if (pendingSave !== null) clearTimeout(pendingSave);
+    pendingSave = setTimeout(() => {
+      pendingSave = null;
+      context.setConfig(options);
+    }, 200);
+  };
+
+  window.addEventListener('beforeunload', flushSave);
+  window.addEventListener('pagehide', flushSave);
 
   const hideVolumeHud = debounce((volumeHud: HTMLElement) => {
     volumeHud.style.opacity = '0';
@@ -49,10 +77,8 @@ export const onPlayerApiReady = async (
     if (typeof options.savedVolume === 'number') {
       // Set saved volume as tooltip
       setTooltip(options.savedVolume);
-
-      if (api.getVolume() !== options.savedVolume) {
-        setVolume(options.savedVolume);
-      }
+      api.setVolume(options.savedVolume);
+      updateVolumeSlider();
     }
 
     setupPlaybar();
@@ -111,16 +137,71 @@ export const onPlayerApiReady = async (
     hideVolumeHud(volumeHud);
   }
 
+  let accumulatedWheelDelta = 0;
+  let lastWheelTime = 0;
+  const MIN_DELTA = 3;
+  const PIXELS_PER_STEP = 60;
+  const MAX_DELTA_PER_EVENT = 22;
+
+  function onWheel(event: WheelEvent) {
+    event.preventDefault();
+    if (event.ctrlKey) return;
+
+    const absDelta = Math.abs(event.deltaY);
+    if (absDelta < MIN_DELTA) {
+      return;
+    }
+
+    const now = performance.now();
+    if (now - lastWheelTime > 60) {
+      accumulatedWheelDelta = 0;
+    }
+    lastWheelTime = now;
+
+    let delta = event.deltaY;
+    if (event.deltaMode === 1) {
+      // DOM_DELTA_LINE (mouse wheel)
+      delta *= 20;
+    } else if (event.deltaMode === 2) {
+      // DOM_DELTA_PAGE
+      delta *= 40;
+    }
+
+    // Clamp fast fling bursts to prevent runaway acceleration
+    if (Math.abs(delta) > MAX_DELTA_PER_EVENT) {
+      delta = MAX_DELTA_PER_EVENT * Math.sign(delta);
+    }
+
+    accumulatedWheelDelta += delta;
+
+    let stepsApplied = 0;
+    while (
+      Math.abs(accumulatedWheelDelta) >= PIXELS_PER_STEP &&
+      stepsApplied < 1
+    ) {
+      const toIncrease = accumulatedWheelDelta < 0;
+      changeVolume(toIncrease);
+      stepsApplied++;
+      if (accumulatedWheelDelta > 0) {
+        accumulatedWheelDelta -= PIXELS_PER_STEP;
+      } else {
+        accumulatedWheelDelta += PIXELS_PER_STEP;
+      }
+    }
+
+    // Bleed off excess momentum so it doesn't queue up or coast
+    if (Math.abs(accumulatedWheelDelta) > PIXELS_PER_STEP) {
+      accumulatedWheelDelta =
+        Math.sign(accumulatedWheelDelta) * (PIXELS_PER_STEP - 1);
+    }
+  }
+
   /** Add onwheel event to video player */
   function setupVideoPlayerOnwheel() {
     const panel = $<HTMLElement>('#main-panel');
     if (!panel) return;
 
-    panel.addEventListener('wheel', (event) => {
-      event.preventDefault();
-      // Event.deltaY < 0 means wheel-up
-      changeVolume(event.deltaY < 0);
-    });
+    panel.addEventListener('wheel', onWheel);
   }
 
   function saveVolume(volume: number) {
@@ -133,11 +214,7 @@ export const onPlayerApiReady = async (
     const playerbar = $<HTMLElement>('ytmusic-player-bar');
     if (!playerbar) return;
 
-    playerbar.addEventListener('wheel', (event) => {
-      event.preventDefault();
-      // Event.deltaY < 0 means wheel-up
-      changeVolume(event.deltaY < 0);
-    });
+    playerbar.addEventListener('wheel', onWheel);
 
     // Keep track of mouse position for showVolumeSlider()
     playerbar.addEventListener('mouseenter', () => {
@@ -148,12 +225,34 @@ export const onPlayerApiReady = async (
       playerbar.classList.remove('on-hover');
     });
 
+    const onVolumeChange = () => {
+      const currentVolume = api ? api.getVolume() : undefined;
+      if (
+        typeof currentVolume === 'number' &&
+        !isNaN(currentVolume) &&
+        currentVolume >= 0 &&
+        options.savedVolume !== currentVolume
+      ) {
+        options.savedVolume = currentVolume;
+        setTooltip(currentVolume);
+        writeOptions();
+      }
+    };
+
+    document
+      .querySelector('video')
+      ?.addEventListener('volumechange', onVolumeChange);
+
     setupSliderObserver();
   }
 
   /** Save volume + Update the volume tooltip when volume-slider is manually changed */
   function setupSliderObserver() {
     const sliderObserver = new MutationObserver((mutations) => {
+      if (suppressNextSliderChange) {
+        suppressNextSliderChange = false;
+        return;
+      }
       for (const mutation of mutations) {
         if (mutation.target.nodeName === 'TP-YT-PAPER-SLIDER') {
           // This checks that volume-slider was manually set
@@ -161,10 +260,8 @@ export const onPlayerApiReady = async (
           const targetValueNumeric = Number(target.value);
           if (
             mutation.oldValue !== target.value &&
-            (typeof options.savedVolume !== 'number' ||
-              Math.abs(options.savedVolume - targetValueNumeric) > 4)
+            options.savedVolume !== targetValueNumeric
           ) {
-            // Diff>4 means it was manually set
             setTooltip(targetValueNumeric);
             saveVolume(targetValueNumeric);
           }
@@ -180,6 +277,11 @@ export const onPlayerApiReady = async (
       attributeFilter: ['value'],
       attributeOldValue: true,
     });
+    // updateVolumeSlider() may already have run once during the startup
+    // restore, before this observer existed to consume the suppress flag
+    // it set - clear any such leftover now so it doesn't wrongly swallow
+    // the first real mutation this observer actually sees.
+    suppressNextSliderChange = false;
   }
 
   function setVolume(value: number) {
@@ -211,6 +313,7 @@ export const onPlayerApiReady = async (
 
   function updateVolumeSlider() {
     const savedVolume = options.savedVolume ?? 0;
+    suppressNextSliderChange = true;
     // Slider value automatically rounds to multiples of 5
     for (const slider of ['#volume-slider', '#expand-volume-slider']) {
       const silderElement = $<HTMLInputElement>(slider);
