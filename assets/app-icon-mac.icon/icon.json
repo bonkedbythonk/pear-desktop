@@ -1,0 +1,24 @@
+{
+  "fill-specializations" : [
+    { "value" : { "solid" : "srgb:0.96078,0.96078,0.96078,1.00000" } },
+    { "appearance" : "dark", "value" : { "solid" : "srgb:0.12157,0.12157,0.12157,1.00000" } }
+  ],
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name-specializations" : [
+            { "value" : "light.png" },
+            { "appearance" : "dark", "value" : "dark.png" }
+          ],
+          "name" : "icon"
+        }
+      ],
+      "shadow" : { "kind" : "none", "opacity" : 0 },
+      "specular" : false,
+      "translucency" : { "enabled" : false, "value" : 0 }
+    }
+  ],
+  "supported-platforms" : { "squares" : [ "macOS" ] }
+}
