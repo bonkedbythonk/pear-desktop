@@ -690,11 +690,11 @@ const getDefaultLocale = (locale: string) =>
   availableLanguages.includes(locale) ? locale : null;
 
 app.whenReady().then(async () => {
-  // The app bundle's own icon (Finder, Launchpad, before launch) is baked in
-  // at build time and can't react to the system appearance, but the Dock
-  // icon can be swapped at runtime - do that here and keep it in sync with
-  // live appearance changes.
-  if (is.macOS()) {
+  // macOS 26 ships appearance-aware app icons, so the bundle's own icon
+  // already follows light/dark everywhere - leave it alone there. Older
+  // versions bake a single icon at build time, so swap the Dock icon at
+  // runtime instead and keep it in sync with live appearance changes.
+  if (is.macOS() && Number.parseInt(process.getSystemVersion(), 10) < 26) {
     const updateDockIcon = () => {
       app.dock?.setIcon(
         nativeTheme.shouldUseDarkColors ? dockIconDark : dockIconLight,
