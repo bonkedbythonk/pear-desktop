@@ -846,6 +846,14 @@
       "description": "Automatically skip silences sections in songs",
       "name": "Skip Silences"
     },
+    "snappy": {
+      "name": "Snappy",
+      "description": "Make switching pages feel faster: starts loading a page while your mouse is on its link, and shortens the slow fade-in on thumbnails",
+      "menu": {
+        "prefetch-on-hover": "Preload pages on hover",
+        "faster-images": "Faster image fade-in"
+      }
+    },
     "smooth-transitions": {
       "name": "Smooth Transitions",
       "description": "Fade the volume smoothly when pausing, resuming, or manually switching songs, instead of an abrupt stop. Does not cover the click/cut when switching the system audio output device - that happens below the browser's audio layer and can't be smoothed from here.",
