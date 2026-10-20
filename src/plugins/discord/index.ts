@@ -5,9 +5,16 @@ import { createPlugin } from '@/utils';
 
 import { backend } from './main';
 import { onMenu } from './menu';
+import { onRendererStart, onRendererStop } from './renderer';
 
 export type DiscordPluginConfig = {
   'enabled': boolean;
+  /**
+   * Whether the presence is currently shown (toggled by the button in the top right)
+   *
+   * @default true
+   */
+  'presenceActive': boolean;
   /**
    * If enabled, will try to reconnect to discord every 5 seconds after disconnecting or failing to connect
    *
@@ -48,6 +55,7 @@ export default createPlugin({
   restartNeeded: false,
   config: {
     'enabled': false,
+    'presenceActive': true,
     'autoReconnect': true,
     'activityTimeoutEnabled': true,
     'activityTimeoutTime': 10 * 60 * 1000,
@@ -58,4 +66,8 @@ export default createPlugin({
   } as DiscordPluginConfig,
   menu: onMenu,
   backend,
+  renderer: {
+    start: onRendererStart,
+    stop: onRendererStop,
+  },
 });

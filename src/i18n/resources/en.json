@@ -476,6 +476,9 @@
         "connected": "Connected to Discord",
         "disconnected": "Disconnected from Discord"
       },
+      "button": {
+        "tooltip": "Toggle Discord Rich Presence"
+      },
       "description": "Show your friends what you listen to with Rich Presence",
       "menu": {
         "auto-reconnect": "Auto reconnect",

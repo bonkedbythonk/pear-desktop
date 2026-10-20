@@ -288,7 +288,7 @@ export class DiscordService {
    * @param songInfo - The current song information.
    */
   updateActivity(songInfo: SongInfo): void {
-    if (!this.config) return;
+    if (!this.config || this.config.presenceActive === false) return;
 
     if (!songInfo.title && !songInfo.artist) {
       if (this.lastSongInfo?.videoId) {
@@ -397,7 +397,12 @@ export class DiscordService {
     this.config = newConfig;
     this.autoReconnect = newConfig.autoReconnect ?? true;
 
-    if (this.lastSongInfo && this.ready && this.rpc.isConnected) {
+    if (
+      newConfig.presenceActive !== false &&
+      this.lastSongInfo &&
+      this.ready &&
+      this.rpc.isConnected
+    ) {
       this.updateActivity(this.lastSongInfo);
     }
 
