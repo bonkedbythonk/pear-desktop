@@ -298,6 +298,12 @@ export class DiscordService {
       return;
     }
 
+    // Paused music shows no presence at all
+    if (songInfo.isPaused) {
+      if (this.lastSongInfo) this.clearActivity();
+      return;
+    }
+
     // Cache the latest song info
     this.timerManager.clear(TimerKey.ClearActivity);
 
